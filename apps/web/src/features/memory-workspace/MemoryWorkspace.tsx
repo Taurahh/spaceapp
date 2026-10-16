@@ -151,7 +151,32 @@ export function MemoryWorkspace({ shellMode, onClose, initialMode = "calendar" }
       window.__spaceMemoryLongTaskMs = max;
     });
     try { observer.observe({ type: "longtask", buffered: true }); } catch { /* Long tasks are not exposed in every browser. */ }
-    return () => observer.disconnect();
+    let frames: PerformanceObserver | null = null;
+    try {
+      frames = new PerformanceObserver(list => {
+        if (window.__spaceMemorySampling) return;
+        const records = window.__spaceMemoryLongFrames ?? [];
+        for (const entry of list.getEntries()) {
+          const timing = entry as PerformanceEntry & { scripts?: Array<{ sourceURL?: string; duration?: number; invoker?: string; name?: string }> };
+          records.push({
+            duration: entry.duration,
+            startTime: entry.startTime,
+            scripts: (timing.scripts ?? []).slice(0, 6).map(script => ({
+              source: script.sourceURL ?? "",
+              duration: script.duration ?? 0,
+              invoker: script.invoker ?? "",
+              name: script.name ?? ""
+            }))
+          });
+        }
+        window.__spaceMemoryLongFrames = records.slice(-8);
+      });
+      frames.observe({ type: "long-animation-frame", buffered: true });
+    } catch { /* Long animation frames are not exposed in every browser. */ }
+    return () => {
+      observer.disconnect();
+      frames?.disconnect();
+    };
   }, [launch]);
 
   useEffect(() => {

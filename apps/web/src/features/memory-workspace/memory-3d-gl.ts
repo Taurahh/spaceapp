@@ -120,10 +120,31 @@ const POSITION_TEXTURE_WIDTH = 256;
 interface ProgramHandles {
   program: WebGLProgram;
   uniforms: Record<string, WebGLUniformLocation | null>;
+  shaders: WebGLShader[];
+  uniformNames: string[];
+}
+
+interface ParallelShaderCompile {
+  COMPLETION_STATUS_KHR: number;
+}
+
+const NODE_UNIFORMS = ["uYaw", "uPitch", "uZoom", "uScale", "uWidth", "uHeight", "uHasFocus", "uPositions", "uPositionWidth"];
+const EDGE_UNIFORMS = ["uYawCos", "uYawSin", "uPitchCos", "uPitchSin", "uZoom", "uScale", "uWidth", "uHeight", "uFocus", "uPositions", "uPositionWidth"];
+const UPLOAD_ROWS = 8;
+const EDGE_PARAM_SLICE = 16_384;
+const PUMP_BUDGET_MS = 8;
+
+type StaticStage = "colors" | "radii" | "states" | "edgeAlloc" | "edgeUpload" | "done";
+type CompileStage = "idle" | "node" | "edge" | "link" | "ready";
+type GLCanvas = HTMLCanvasElement | OffscreenCanvas;
+
+interface MemoryGraphGLMetrics {
+  uploadMs?: number;
+  positionMs?: number;
 }
 
 export class MemoryGraphWebGL {
-  readonly canvas: HTMLCanvasElement;
+  readonly canvas: GLCanvas;
   private gl: WebGL2RenderingContext;
   private lost = false;
   private nodeProgram: ProgramHandles | null = null;
@@ -141,20 +162,39 @@ export class MemoryGraphWebGL {
   private edgePairs: Uint32Array = new Uint32Array();
   private edgeTypes: Uint8Array = new Uint8Array();
   private edgeParams: Float32Array = new Float32Array();
-  private positionImage = new Float32Array();
   private textures: WebGLTexture[] = [];
-  private textureIndex = 0;
+  private front = 0;
   private texWidth = 0;
   private texHeight = 0;
   private positionsDirty = true;
+  private compileStage: CompileStage = "idle";
+  private parallel: ParallelShaderCompile | null = null;
+  private pendingShaders: WebGLShader[] = [];
+  private staticStage: StaticStage = "done";
+  private edgeParamsDirty = false;
+  private edgeParamCursor = 0;
+  private edgeUploadCursor = 0;
+  private positionGeneration = 0;
+  private uploadedGeneration = -1;
+  private fillGeneration = 0;
+  private filling = false;
+  private uploadRow = 0;
+  private fillTexture = 0;
+  private rowImage = new Float32Array();
+  private dpr = 1;
   private nodeColorBuffer: WebGLBuffer | null = null;
   private nodeRadiusBuffer: WebGLBuffer | null = null;
   private nodeStateBuffer: WebGLBuffer | null = null;
   private edgeParamBuffer: WebGLBuffer | null = null;
   onContextLost: () => void = () => undefined;
   onContextRestored: () => void = () => undefined;
+  onMetrics: (metrics: MemoryGraphGLMetrics) => void = metrics => {
+    const root = globalThis as typeof globalThis & { __spaceMemoryUploadMs?: number; __spaceMemoryPositionMs?: number };
+    if (metrics.uploadMs !== undefined) root.__spaceMemoryUploadMs = metrics.uploadMs;
+    if (metrics.positionMs !== undefined) root.__spaceMemoryPositionMs = Math.max(root.__spaceMemoryPositionMs ?? 0, metrics.positionMs);
+  };
 
-  private constructor(canvas: HTMLCanvasElement, gl: WebGL2RenderingContext) {
+  private constructor(canvas: GLCanvas, gl: WebGL2RenderingContext) {
     this.canvas = canvas;
     this.gl = gl;
     canvas.addEventListener("webglcontextlost", (event) => {
@@ -167,10 +207,9 @@ export class MemoryGraphWebGL {
       this.recover();
       this.onContextRestored();
     });
-    this.compile();
   }
 
-  static create(canvas: HTMLCanvasElement): MemoryGraphWebGL | null {
+  static create(canvas: GLCanvas): MemoryGraphWebGL | null {
     const gl = canvas.getContext("webgl2", {
       alpha: true,
       antialias: false,
@@ -195,7 +234,7 @@ export class MemoryGraphWebGL {
     return this.gl.getParameter(extension.UNMASKED_RENDERER_WEBGL) as string;
   }
 
-  setGraph(packed: PackedMemoryGraph) {
+  setGraph(packed: Pick<PackedMemoryGraph, "count" | "edgeCount" | "xyz" | "colors" | "radii" | "edgePairs" | "edgeTypes">) {
     const started = performance.now();
     this.count = packed.count;
     this.edgeCount = packed.edgeCount;
@@ -206,15 +245,61 @@ export class MemoryGraphWebGL {
     this.edgeTypes = packed.edgeTypes;
     this.states = new Uint8Array(packed.count);
     this.focus = -1;
+    this.edgeParamsDirty = true;
+    this.edgeParamCursor = 0;
+    this.edgeUploadCursor = 0;
+    this.staticStage = "colors";
+    this.positionGeneration++;
+    this.filling = false;
+    this.uploadRow = 0;
     this.positionsDirty = true;
-    this.ensureEdgeParams();
-    this.uploadAll();
-    if (typeof window !== "undefined") window.__spaceMemoryUploadMs = performance.now() - started;
+    this.onMetrics({ uploadMs: performance.now() - started });
   }
 
-  /** Keep the latest positions. The texture is uploaded once on the next frame. */
+  setDeviceScale(dpr: number) {
+    this.dpr = dpr;
+  }
+
+  /** Advance compile and uploads by a few milliseconds so one turn stays under the long-task budget. */
+  pump(budgetMs = PUMP_BUDGET_MS): boolean {
+    if (this.contextLost) return true;
+    const deadline = performance.now() + budgetMs;
+    if (this.compileStage !== "ready") {
+      this.pumpCompile();
+      return false;
+    }
+    if (this.edgeParamsDirty) {
+      this.pumpEdgeParams();
+      return false;
+    }
+    if (this.staticStage !== "done") {
+      this.pumpStaticBuffer();
+      return false;
+    }
+    if (this.count > 0 && (this.filling || this.uploadedGeneration !== this.positionGeneration)) {
+      this.pumpPositions(deadline);
+    }
+    return this.idle();
+  }
+
+  idle(): boolean {
+    if (this.contextLost) return true;
+    if (this.compileStage !== "ready" || this.edgeParamsDirty || this.staticStage !== "done" || this.filling) return false;
+    if (this.count === 0) return true;
+    return this.uploadedGeneration === this.positionGeneration;
+  }
+
+  startCompile() {
+    if (this.contextLost || this.gl.isContextLost()) return;
+    this.discardGpu();
+    this.parallel = this.gl.getExtension("KHR_parallel_shader_compile") as ParallelShaderCompile | null;
+    this.compileStage = "node";
+  }
+
+  /** Keep the latest positions. The texture is filled in row slices on later turns. */
   setPositions(xyz: Float32Array) {
     this.xyz = xyz;
+    this.positionGeneration++;
     this.positionsDirty = true;
   }
 
@@ -230,10 +315,17 @@ export class MemoryGraphWebGL {
     gl.bindBuffer(gl.ARRAY_BUFFER, null);
   }
 
-  render(camera: MemoryCamera3D, scale: number, width: number, height: number, sync = false) {
-    if (this.contextLost || !this.nodeProgram || !this.edgeProgram || width <= 0 || height <= 0) return;
+  get nodeCount() { return this.count; }
+
+  get uploadedCount() { return this.uploadedGeneration; }
+
+  /** GPU elapsed time for this frame when `sync` is set, otherwise null. */
+  render(camera: MemoryCamera3D, scale: number, width: number, height: number, sync = false): number | null {
+    if (this.contextLost || width <= 0 || height <= 0) return null;
+    this.pump();
+    if (!this.nodeProgram || !this.edgeProgram || this.compileStage !== "ready" || this.uploadedGeneration < 0) return null;
     const gl = this.gl;
-    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    const dpr = Math.min(this.dpr || 1, 2);
     const bufferWidth = Math.max(1, Math.round(width * dpr));
     const bufferHeight = Math.max(1, Math.round(height * dpr));
     if (this.canvas.width !== bufferWidth || this.canvas.height !== bufferHeight) {
@@ -247,20 +339,38 @@ export class MemoryGraphWebGL {
     gl.depthFunc(gl.LEQUAL);
     gl.enable(gl.BLEND);
     gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
-    this.uploadPositions();
-    if (this.contextLost) return;
+    if (this.contextLost) return null;
     this.bindPositions();
     this.drawEdges(camera, scale, width, height);
     this.drawNodes(camera, scale, width, height);
     gl.bindVertexArray(null);
-    if (sync) gl.finish();
+    if (sync) this.waitForGpu();
+    return null;
+  }
+
+  /** gl.finish returns before SwiftShader retires worker commands. A flushed fence waits for them. */
+  private waitForGpu() {
+    const gl = this.gl;
+    const fence = gl.fenceSync(gl.SYNC_GPU_COMMANDS_COMPLETE, 0);
+    gl.flush();
+    if (!fence) {
+      gl.finish();
+      return;
+    }
+    gl.clientWaitSync(fence, gl.SYNC_FLUSH_COMMANDS_BIT, 2_000_000_000);
+    gl.deleteSync(fence);
   }
 
   recover() {
     if (this.gl.isContextLost()) return;
     this.lost = false;
-    this.compile();
-    this.uploadAll();
+    this.uploadedGeneration = -1;
+    this.filling = false;
+    this.staticStage = this.count > 0 ? "colors" : "done";
+    this.edgeParamsDirty = this.edgeCount > 0;
+    this.edgeParamCursor = 0;
+    this.positionGeneration++;
+    this.startCompile();
   }
 
   dispose() {
@@ -275,22 +385,50 @@ export class MemoryGraphWebGL {
     if (this.edgeProgram) gl.deleteProgram(this.edgeProgram.program);
   }
 
-  private compile() {
+  private pumpCompile() {
+    try {
+      if (this.compileStage === "idle") this.startCompile();
+      if (this.compileStage === "node") {
+        if (this.parallel) {
+          this.nodeProgram = this.linkUnblocked(NODE_VERTEX, NODE_FRAGMENT, NODE_UNIFORMS);
+          this.edgeProgram = this.linkUnblocked(EDGE_VERTEX, EDGE_FRAGMENT, EDGE_UNIFORMS);
+          this.compileStage = "link";
+          return;
+        }
+        this.nodeProgram = this.link(NODE_VERTEX, NODE_FRAGMENT, NODE_UNIFORMS);
+        this.compileStage = "edge";
+        return;
+      }
+      if (this.compileStage === "edge") {
+        this.edgeProgram = this.link(EDGE_VERTEX, EDGE_FRAGMENT, EDGE_UNIFORMS);
+        this.finishVertexArrays();
+        this.compileStage = "ready";
+        return;
+      }
+      if (this.compileStage === "link") {
+        const extension = this.parallel;
+        if (!extension || !this.nodeProgram || !this.edgeProgram) throw new Error("WebGL program allocation failed.");
+        const gl = this.gl;
+        const nodeDone = gl.getProgramParameter(this.nodeProgram.program, extension.COMPLETION_STATUS_KHR);
+        const edgeDone = gl.getProgramParameter(this.edgeProgram.program, extension.COMPLETION_STATUS_KHR);
+        if (!nodeDone || !edgeDone) return;
+        this.finalizeProgram(this.nodeProgram);
+        this.finalizeProgram(this.edgeProgram);
+        this.finishVertexArrays();
+        this.compileStage = "ready";
+      }
+    } catch {
+      this.lost = true;
+      this.compileStage = "ready";
+      this.onContextLost();
+    }
+  }
+
+  private finishVertexArrays() {
     const gl = this.gl;
-    for (const texture of this.textures) gl.deleteTexture(texture);
-    for (const buffer of this.buffers) gl.deleteBuffer(buffer);
-    if (this.nodeVao) gl.deleteVertexArray(this.nodeVao);
-    if (this.edgeVao) gl.deleteVertexArray(this.edgeVao);
-    if (this.nodeProgram) gl.deleteProgram(this.nodeProgram.program);
-    if (this.edgeProgram) gl.deleteProgram(this.edgeProgram.program);
-    this.nodeProgram = this.link(NODE_VERTEX, NODE_FRAGMENT, ["uYaw", "uPitch", "uZoom", "uScale", "uWidth", "uHeight", "uHasFocus", "uPositions", "uPositionWidth"]);
-    this.edgeProgram = this.link(EDGE_VERTEX, EDGE_FRAGMENT, ["uYawCos", "uYawSin", "uPitchCos", "uPitchSin", "uZoom", "uScale", "uWidth", "uHeight", "uFocus", "uPositions", "uPositionWidth"]);
     this.nodeVao = gl.createVertexArray();
     this.edgeVao = gl.createVertexArray();
     this.buffers = [];
-    this.textures = [];
-    this.texWidth = 0;
-    this.texHeight = 0;
     this.nodeColorBuffer = this.buffer();
     this.nodeRadiusBuffer = this.buffer();
     this.nodeStateBuffer = this.buffer();
@@ -302,6 +440,32 @@ export class MemoryGraphWebGL {
     this.configureEdgeVao(quad);
     gl.bindVertexArray(null);
     gl.bindBuffer(gl.ARRAY_BUFFER, null);
+  }
+
+  private discardGpu() {
+    if (this.gl.isContextLost()) return;
+    const gl = this.gl;
+    for (const texture of this.textures) gl.deleteTexture(texture);
+    this.textures = [];
+    this.texWidth = 0;
+    this.texHeight = 0;
+    this.uploadedGeneration = -1;
+    for (const buffer of this.buffers) gl.deleteBuffer(buffer);
+    this.buffers = [];
+    this.nodeColorBuffer = null;
+    this.nodeRadiusBuffer = null;
+    this.nodeStateBuffer = null;
+    this.edgeParamBuffer = null;
+    if (this.nodeVao) gl.deleteVertexArray(this.nodeVao);
+    if (this.edgeVao) gl.deleteVertexArray(this.edgeVao);
+    this.nodeVao = null;
+    this.edgeVao = null;
+    if (this.nodeProgram) gl.deleteProgram(this.nodeProgram.program);
+    if (this.edgeProgram) gl.deleteProgram(this.edgeProgram.program);
+    this.nodeProgram = null;
+    this.edgeProgram = null;
+    for (const shader of this.pendingShaders) gl.deleteShader(shader);
+    this.pendingShaders = [];
   }
 
   private configureNodeVao(quad: WebGLBuffer) {
@@ -338,97 +502,137 @@ export class MemoryGraphWebGL {
     gl.vertexAttribDivisor(1, 1);
   }
 
-  private uploadAll() {
-    if (this.contextLost) return;
-    const gl = this.gl;
-    gl.bindBuffer(gl.ARRAY_BUFFER, this.nodeColorBuffer);
-    gl.bufferData(gl.ARRAY_BUFFER, this.colors, gl.STATIC_DRAW);
-    gl.bindBuffer(gl.ARRAY_BUFFER, this.nodeRadiusBuffer);
-    gl.bufferData(gl.ARRAY_BUFFER, this.radii, gl.STATIC_DRAW);
-    gl.bindBuffer(gl.ARRAY_BUFFER, this.nodeStateBuffer);
-    gl.bufferData(gl.ARRAY_BUFFER, this.states, gl.DYNAMIC_DRAW);
-    gl.bindBuffer(gl.ARRAY_BUFFER, this.edgeParamBuffer);
-    gl.bufferData(gl.ARRAY_BUFFER, this.edgeParams, gl.STATIC_DRAW);
-    gl.bindBuffer(gl.ARRAY_BUFFER, null);
-    this.uploadPositions();
-  }
-
-  private ensureEdgeParams() {
-    if (this.edgeParams.length !== this.edgeCount * 3) this.edgeParams = new Float32Array(this.edgeCount * 3);
-    for (let edge = 0; edge < this.edgeCount; edge++) {
+  private pumpEdgeParams() {
+    if (this.edgeParams.length !== this.edgeCount * 3) {
+      this.edgeParams = new Float32Array(this.edgeCount * 3);
+      this.edgeParamCursor = 0;
+    }
+    const sliceEnd = Math.min(this.edgeCount, this.edgeParamCursor + EDGE_PARAM_SLICE);
+    for (let edge = this.edgeParamCursor; edge < sliceEnd; edge++) {
       const cursor = edge * 3;
       this.edgeParams[cursor] = this.edgePairs[edge * 2] ?? -1;
       this.edgeParams[cursor + 1] = this.edgePairs[edge * 2 + 1] ?? -1;
       this.edgeParams[cursor + 2] = this.edgeTypes[edge] ?? 0;
     }
+    this.edgeParamCursor = sliceEnd;
+    if (this.edgeParamCursor >= this.edgeCount) this.edgeParamsDirty = false;
   }
 
-  /** Two float textures so a frame can sample one while the next upload fills the other. */
-  private ensureTextures(width: number, height: number) {
-    if (this.textures.length === 2 && this.texWidth === width && this.texHeight === height) return;
+  private pumpStaticBuffer() {
+    if (this.contextLost || !this.nodeColorBuffer || !this.nodeRadiusBuffer || !this.nodeStateBuffer || !this.edgeParamBuffer) return;
     const gl = this.gl;
-    for (const texture of this.textures) gl.deleteTexture(texture);
-    this.textures = [];
-    for (let index = 0; index < 2; index++) {
-      const texture = gl.createTexture();
-      if (!texture) throw new Error("WebGL texture allocation failed.");
-      gl.bindTexture(gl.TEXTURE_2D, texture);
-      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
-      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
-      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
-      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-      gl.getError();
-      gl.texStorage2D(gl.TEXTURE_2D, 1, gl.RGBA32F, width, height);
-      const error = gl.getError();
-      if (error !== gl.NO_ERROR) throw new Error(`Position texture allocation failed (${error}).`);
-      this.textures.push(texture);
+    if (this.staticStage === "colors") {
+      gl.bindBuffer(gl.ARRAY_BUFFER, this.nodeColorBuffer);
+      gl.bufferData(gl.ARRAY_BUFFER, this.colors, gl.STATIC_DRAW);
+      this.staticStage = "radii";
+    } else if (this.staticStage === "radii") {
+      gl.bindBuffer(gl.ARRAY_BUFFER, this.nodeRadiusBuffer);
+      gl.bufferData(gl.ARRAY_BUFFER, this.radii, gl.STATIC_DRAW);
+      this.staticStage = "states";
+    } else if (this.staticStage === "states") {
+      gl.bindBuffer(gl.ARRAY_BUFFER, this.nodeStateBuffer);
+      gl.bufferData(gl.ARRAY_BUFFER, this.states, gl.DYNAMIC_DRAW);
+      this.staticStage = "edgeAlloc";
+    } else if (this.staticStage === "edgeAlloc") {
+      gl.bindBuffer(gl.ARRAY_BUFFER, this.edgeParamBuffer);
+      gl.bufferData(gl.ARRAY_BUFFER, this.edgeParams.byteLength, gl.STATIC_DRAW);
+      this.edgeUploadCursor = 0;
+      this.staticStage = "edgeUpload";
+    } else if (this.staticStage === "edgeUpload") {
+      const floats = Math.min(EDGE_PARAM_SLICE * 3, this.edgeParams.length - this.edgeUploadCursor);
+      gl.bindBuffer(gl.ARRAY_BUFFER, this.edgeParamBuffer);
+      if (floats > 0) {
+        gl.bufferSubData(gl.ARRAY_BUFFER, this.edgeUploadCursor * 4, this.edgeParams.subarray(this.edgeUploadCursor, this.edgeUploadCursor + floats));
+        this.edgeUploadCursor += floats;
+      }
+      if (this.edgeUploadCursor >= this.edgeParams.length) this.staticStage = "done";
     }
-    this.texWidth = width;
-    this.texHeight = height;
-    this.textureIndex = 0;
-    gl.bindTexture(gl.TEXTURE_2D, null);
+    gl.bindBuffer(gl.ARRAY_BUFFER, null);
   }
 
-  private uploadPositions() {
-    if (!this.positionsDirty || this.contextLost || this.count === 0) return;
-    const started = performance.now();
+  /** One texture allocation per call, then row slices, so a cold driver cannot fill a whole task. */
+  private pumpPositions(deadline: number) {
     const width = POSITION_TEXTURE_WIDTH;
     const height = Math.max(1, Math.ceil(this.count / width));
-    try {
-      this.ensureTextures(width, height);
-    } catch {
-      this.lost = true;
-      this.onContextLost();
-      return;
+    if (!this.filling) {
+      try {
+        if (!this.prepareTextureSlot(width, height)) return;
+      } catch {
+        this.lost = true;
+        this.onContextLost();
+        return;
+      }
+      this.filling = true;
+      this.uploadRow = 0;
+      this.fillGeneration = this.positionGeneration;
+      this.fillTexture = this.front ^ 1;
     }
-    const needed = width * height * 4;
-    if (this.positionImage.length !== needed) this.positionImage = new Float32Array(needed);
-    const image = this.positionImage;
-    const xyz = this.xyz;
-    for (let index = 0; index < this.count; index++) {
-      const source = index * 3;
-      const target = index * 4;
-      image[target] = xyz[source] ?? 0;
-      image[target + 1] = xyz[source + 1] ?? 0;
-      image[target + 2] = xyz[source + 2] ?? 0;
-    }
-    const next = this.textureIndex ^ 1;
+    const started = performance.now();
     const gl = this.gl;
-    gl.bindTexture(gl.TEXTURE_2D, this.textures[next] ?? null);
-    gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, width, height, gl.RGBA, gl.FLOAT, image);
-    gl.bindTexture(gl.TEXTURE_2D, null);
-    this.textureIndex = next;
-    this.positionsDirty = false;
-    if (typeof window !== "undefined") {
-      const elapsed = performance.now() - started;
-      window.__spaceMemoryPositionMs = Math.max(window.__spaceMemoryPositionMs ?? 0, elapsed);
+    gl.bindTexture(gl.TEXTURE_2D, this.textures[this.fillTexture] ?? null);
+    const floatsPerRow = width * 4;
+    if (this.rowImage.length < floatsPerRow * UPLOAD_ROWS) this.rowImage = new Float32Array(floatsPerRow * UPLOAD_ROWS);
+    if (this.uploadRow < height && performance.now() < deadline) {
+      const rows = Math.min(UPLOAD_ROWS, height - this.uploadRow);
+      const rowStart = this.uploadRow * width;
+      for (let local = 0; local < rows * width; local++) {
+        const index = rowStart + local;
+        const target = local * 4;
+        if (index >= this.count) {
+          this.rowImage[target] = 0;
+          this.rowImage[target + 1] = 0;
+          this.rowImage[target + 2] = 0;
+          continue;
+        }
+        const source = index * 3;
+        this.rowImage[target] = this.xyz[source] ?? 0;
+        this.rowImage[target + 1] = this.xyz[source + 1] ?? 0;
+        this.rowImage[target + 2] = this.xyz[source + 2] ?? 0;
+      }
+      gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, this.uploadRow, width, rows, gl.RGBA, gl.FLOAT, this.rowImage.subarray(0, rows * floatsPerRow));
+      this.uploadRow += rows;
     }
+    gl.bindTexture(gl.TEXTURE_2D, null);
+    if (this.uploadRow >= height) {
+      this.front = this.fillTexture;
+      this.uploadedGeneration = this.fillGeneration;
+      this.filling = false;
+      this.positionsDirty = false;
+    }
+    this.onMetrics({ positionMs: performance.now() - started });
+  }
+
+  private prepareTextureSlot(width: number, height: number): boolean {
+    if (this.textures.length === 2 && this.texWidth === width && this.texHeight === height) return true;
+    const gl = this.gl;
+    if (this.texWidth !== width || this.texHeight !== height) {
+      for (const texture of this.textures) gl.deleteTexture(texture);
+      this.textures = [];
+      this.texWidth = width;
+      this.texHeight = height;
+      this.uploadedGeneration = -1;
+      this.front = 0;
+    }
+    const texture = gl.createTexture();
+    if (!texture) throw new Error("WebGL texture allocation failed.");
+    gl.bindTexture(gl.TEXTURE_2D, texture);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    gl.getError();
+    gl.texStorage2D(gl.TEXTURE_2D, 1, gl.RGBA32F, width, height);
+    const error = gl.getError();
+    gl.bindTexture(gl.TEXTURE_2D, null);
+    if (error !== gl.NO_ERROR) throw new Error(`Position texture allocation failed (${error}).`);
+    this.textures.push(texture);
+    return this.textures.length === 2;
   }
 
   private bindPositions() {
     if (!this.nodeProgram || !this.edgeProgram || this.textures.length < 2) return;
     const gl = this.gl;
-    const texture = this.textures[this.textureIndex] ?? null;
+    const texture = this.textures[this.front] ?? null;
     gl.activeTexture(gl.TEXTURE0);
     gl.bindTexture(gl.TEXTURE_2D, texture);
     for (const program of [this.nodeProgram, this.edgeProgram]) {
@@ -484,42 +688,54 @@ export class MemoryGraphWebGL {
   }
 
   private link(vertexSource: string, fragmentSource: string, uniformNames: string[]): ProgramHandles {
+    const linked = this.linkUnblocked(vertexSource, fragmentSource, uniformNames);
+    this.finalizeProgram(linked);
+    return linked;
+  }
+
+  /** Submits compile and link without asking for status, so KHR_parallel_shader_compile can run off the caller. */
+  private linkUnblocked(vertexSource: string, fragmentSource: string, uniformNames: string[]): ProgramHandles {
     const gl = this.gl;
     const program = gl.createProgram();
     if (!program) throw new Error("WebGL program allocation failed.");
-    const vertex = this.shader(gl.VERTEX_SHADER, vertexSource);
-    const fragment = this.shader(gl.FRAGMENT_SHADER, fragmentSource);
+    const vertex = this.compileShader(gl.VERTEX_SHADER, vertexSource);
+    const fragment = this.compileShader(gl.FRAGMENT_SHADER, fragmentSource);
     gl.attachShader(program, vertex);
     gl.attachShader(program, fragment);
     gl.linkProgram(program);
-    gl.deleteShader(vertex);
-    gl.deleteShader(fragment);
-    if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
-      const log = gl.getProgramInfoLog(program) ?? "link failed";
-      gl.deleteProgram(program);
-      throw new Error(log);
-    }
-    const uniforms: Record<string, WebGLUniformLocation | null> = {};
-    for (const name of uniformNames) uniforms[name] = gl.getUniformLocation(program, name);
-    return { program, uniforms };
+    return { program, uniforms: {}, shaders: [vertex, fragment], uniformNames };
   }
 
-  private shader(type: number, source: string) {
+  private finalizeProgram(linked: ProgramHandles) {
+    const gl = this.gl;
+    for (const shader of linked.shaders) {
+      if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
+        const log = gl.getShaderInfoLog(shader) ?? "compile failed";
+        gl.deleteShader(shader);
+        throw new Error(log);
+      }
+    }
+    if (!gl.getProgramParameter(linked.program, gl.LINK_STATUS)) {
+      const log = gl.getProgramInfoLog(linked.program) ?? "link failed";
+      gl.deleteProgram(linked.program);
+      throw new Error(log);
+    }
+    for (const shader of linked.shaders) {
+      const index = this.pendingShaders.indexOf(shader);
+      if (index >= 0) this.pendingShaders.splice(index, 1);
+      gl.deleteShader(shader);
+    }
+    linked.shaders = [];
+    for (const name of linked.uniformNames) linked.uniforms[name] = gl.getUniformLocation(linked.program, name);
+  }
+
+  private compileShader(type: number, source: string) {
     const gl = this.gl;
     const shader = gl.createShader(type);
     if (!shader) throw new Error("WebGL shader allocation failed.");
     gl.shaderSource(shader, source);
     gl.compileShader(shader);
-    if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
-      const log = gl.getShaderInfoLog(shader) ?? "compile failed";
-      gl.deleteShader(shader);
-      throw new Error(log);
-    }
+    this.pendingShaders.push(shader);
     return shader;
   }
-}
-
-export function chooseMemoryGraphRenderer(input: { webgl2: boolean; contextLost: boolean }): "webgl2" | "canvas2d" {
-  if (!input.webgl2 || input.contextLost) return "canvas2d";
-  return "webgl2";
 }

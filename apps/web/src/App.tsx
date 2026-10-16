@@ -77,7 +77,7 @@ import {
 } from "./features/ui-theme/app-icons.js";
 import { SensitiveDataMask } from "./features/sensitive-data/SensitiveDataMask.js";
 import { SpaceToggle } from "./features/ui-controls/SpaceToggle.js";
-import { lazy, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type DragEvent as ReactDragEvent, type ReactNode, type RefObject } from "react";
+import { lazy, startTransition, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type DragEvent as ReactDragEvent, type ReactNode, type RefObject } from "react";
 import type {
   Artifact,
   AgentRuntime,
@@ -1382,11 +1382,17 @@ export function App() {
     roomEventsRef.current = snapshot.events;
     swarmStateRef.current = snapshot.swarm;
     selectedPaneIdRef.current = snapshot.selectedPaneId;
-    setPanes(snapshot.panes);
-    setTurns(snapshot.turns);
-    setRoomEvents(snapshot.events);
-    setSwarmState(snapshot.swarm);
-    setSelectedPaneId(snapshot.selectedPaneId);
+    const publish = () => {
+      setPanes(snapshot.panes);
+      setTurns(snapshot.turns);
+      setRoomEvents(snapshot.events);
+      setSwarmState(snapshot.swarm);
+      setSelectedPaneId(snapshot.selectedPaneId);
+    };
+    // A direct 50k launch renders the covered shell and the graph together. Time-slice the shell
+    // so that commit stays under the main-thread load budget; ordinary room switches stay eager.
+    if (readMemoryGraphLaunch()) startTransition(publish);
+    else publish();
   }
 
   function clearActiveRoomRuntime() {

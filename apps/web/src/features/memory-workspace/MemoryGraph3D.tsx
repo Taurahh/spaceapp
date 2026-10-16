@@ -3,7 +3,7 @@ import type { MemoryGraphEdge, MemoryGraphNode } from "@space/contracts";
 import type { MemoryAtlasPosition } from "./memory-atlas.js";
 import { findPackedText, packedText, prepareMemoryGraph, type PackedMemoryGraph } from "./memory-3d-buffers.js";
 import { paintMemoryGraphCanvas } from "./memory-3d-canvas.js";
-import { chooseMemoryGraphRenderer, MemoryGraphWebGL } from "./memory-3d-gl.js";
+import { chooseMemoryGraphRenderer, openMemoryGraphGL, type MemoryGraphGLClient } from "./memory-3d-gl-client.js";
 import { MAX_LABEL_CANDIDATES, selectMemoryLabels } from "./memory-3d-labels.js";
 import {
   DEFAULT_MEMORY_CAMERA,
@@ -36,16 +36,21 @@ export interface MemoryGraphFrameSample {
 declare global {
   interface Window {
     __spaceMemoryBenchmark?: MemoryGraphFrameSample | { status: "running" | "error" | "waiting"; message?: string };
+    __spaceMemoryFrameSamples?: number[];
     __spaceMemoryLongTaskMs?: number;
     __spaceMemoryFrames?: number;
     __spaceMemorySplit?: { preparedMs: number; drawMs: number; labelMs: number; nodes: number; edges: number };
     __spaceMemoryUploadMs?: number;
     __spaceMemoryHandlerMs?: number;
     __spaceMemoryPositionMs?: number;
+    __spaceMemoryWarmMs?: number;
+    __spaceMemoryGLError?: string;
+    __spaceMemoryDraw?: { ms: number; drew: boolean; count: number; uploaded: number; bufferWidth: number; bufferHeight: number; gpuMs: number | null; gpuNanos: number; wallMs: number };
     __spaceMemorySampling?: boolean;
     __spaceMemoryLongTask?: { duration: number; startTime: number; name: string; attribution?: Array<{ name: string; containerType: string; containerName: string; containerSrc: string }> };
     __spaceMemoryLongTasks?: Array<{ duration: number; startTime: number; name: string; attribution?: Array<{ name: string; containerType: string; containerName: string; containerSrc: string }> }>;
     __spaceMemoryMarks?: Array<[string, number]>;
+    __spaceMemoryLongFrames?: Array<{ duration: number; startTime: number; scripts: Array<{ source: string; duration: number; invoker: string; name: string }> }>;
   }
 }
 
@@ -73,7 +78,7 @@ export const MemoryGraph3D = forwardRef<MemoryGraph3DHandle, {
   const propsRef = useRef(props);
   propsRef.current = props;
   const packedRef = useRef<PackedMemoryGraph | null>(props.stream ?? null);
-  const rendererRef = useRef<MemoryGraphWebGL | null>(null);
+  const rendererRef = useRef<MemoryGraphGLClient | null>(null);
   const modeRef = useRef<"webgl2" | "canvas2d">("canvas2d");
   const redrawRef = useRef<() => void>(() => {});
   const refreshLabelsRef = useRef<() => void>(() => {});
@@ -87,6 +92,11 @@ export const MemoryGraph3D = forwardRef<MemoryGraph3DHandle, {
   const focusRef = useRef(-1);
   const fallbackIndexesRef = useRef<Uint32Array>(new Uint32Array());
   const fallbackEdgesRef = useRef<Uint32Array>(new Uint32Array());
+  const pumpRef = useRef<() => void>(() => {});
+  const glBootRef = useRef<Promise<MemoryGraphGLClient | null> | null>(null);
+  const glEpochRef = useRef(0);
+  const glActiveRef = useRef(0);
+  const glFailedRef = useRef(false);
 
   const syncFocus = (index: number) => {
     focusRef.current = index;
@@ -102,6 +112,7 @@ export const MemoryGraph3D = forwardRef<MemoryGraph3DHandle, {
       fallbackEdgesRef.current = canvasFallbackEdgeIndexes(packed.edgePairs, fallbackIndexesRef.current, packed.count);
       pickDirtyRef.current = true;
       rendererRef.current?.setGraph(packed);
+      pumpRef.current();
       const selected = propsRef.current.selectedNodeId
         ? findPackedText(packed.ids, packed.idOffsets, propsRef.current.selectedNodeId)
         : -1;
@@ -115,6 +126,7 @@ export const MemoryGraph3D = forwardRef<MemoryGraph3DHandle, {
       packed.xyz = xyz;
       pickDirtyRef.current = true;
       rendererRef.current?.setPositions(xyz);
+      pumpRef.current();
       if (done) refreshLabelsRef.current();
       redrawRef.current();
       if (done && propsRef.current.benchmark && !samplingRef.current) {
@@ -135,12 +147,9 @@ export const MemoryGraph3D = forwardRef<MemoryGraph3DHandle, {
     const overlay = overlayRef.current;
     const fallback = fallbackRef.current;
     if (!surface || !glCanvas || !overlay || !fallback) return;
-    const renderer = MemoryGraphWebGL.create(glCanvas);
-    rendererRef.current = renderer;
-    let mode = chooseMemoryGraphRenderer({ webgl2: Boolean(renderer), contextLost: false });
-    modeRef.current = mode;
+    const epoch = ++glEpochRef.current;
+    glActiveRef.current = epoch;
     const setMode = (next: "webgl2" | "canvas2d") => {
-      mode = next;
       modeRef.current = next;
       glCanvas.hidden = next !== "webgl2";
       fallback.hidden = next !== "canvas2d";
@@ -155,18 +164,26 @@ export const MemoryGraph3D = forwardRef<MemoryGraph3DHandle, {
       inactive.tabIndex = -1;
       surface.dataset.renderer = next;
     };
-    setMode(mode);
-    if (renderer) {
-      renderer.onContextLost = () => setMode("canvas2d");
-      renderer.onContextRestored = () => {
-        renderer.recover();
-        const packed = packedRef.current;
-        if (packed) renderer.setGraph(packed);
-        renderer.setFocus(focusRef.current);
-        setMode("webgl2");
-        redrawRef.current();
-      };
+    if (!glBootRef.current) {
+      glBootRef.current = openMemoryGraphGL(glCanvas, window.devicePixelRatio || 1, {
+        onLost: () => setMode("canvas2d"),
+        onRestored: () => {
+          const packed = packedRef.current;
+          if (packed) rendererRef.current?.setGraph(packed);
+          rendererRef.current?.setFocus(focusRef.current);
+          setMode("webgl2");
+          redrawRef.current();
+        }
+      });
     }
+    void glBootRef.current.then(renderer => {
+      if (glActiveRef.current !== epoch) return;
+      rendererRef.current = renderer;
+      glFailedRef.current = !renderer;
+      setMode(chooseMemoryGraphRenderer({ webgl2: Boolean(renderer), contextLost: false }));
+      if (renderer && packedRef.current) renderer.setGraph(packedRef.current);
+      redrawRef.current();
+    });
     let frame = 0;
     let width = 1;
     let height = 1;
@@ -270,7 +287,7 @@ export const MemoryGraph3D = forwardRef<MemoryGraph3DHandle, {
         const labelStarted = performance.now();
         drawLabels(packed);
         window.__spaceMemorySplit = { preparedMs, drawMs, labelMs: performance.now() - labelStarted, nodes: packed.count, edges: packed.edgeCount };
-      } else {
+      } else if (glFailedRef.current || rendererRef.current?.contextLost || !glBootRef.current) {
         const context = fallback.getContext("2d");
         if (context) {
           paintMemoryGraphCanvas(context, packed, fallbackIndexesRef.current, cameraRef.current, scale, width, height, focusRef.current, propsRef.current.showTitles, rendererStates(packed, focusRef.current), fallbackEdgesRef.current);
@@ -390,20 +407,36 @@ export const MemoryGraph3D = forwardRef<MemoryGraph3DHandle, {
     };
     sampleRef.current = async () => {
       const samples: number[] = [];
-      window.__spaceMemorySampling = true;
       window.__spaceMemoryBenchmark = { status: "running" };
       const channel = new MessageChannel();
       const yieldFrame = () => new Promise<void>(resolve => {
         channel.port1.onmessage = () => resolve();
         channel.port2.postMessage(null);
       });
+      const flushDeadline = performance.now() + 30_000;
+      while (performance.now() < flushDeadline) {
+        const renderer = rendererRef.current;
+        if (renderer?.contextLost) break;
+        if (renderer && modeRef.current === "webgl2" && renderer.idle()) break;
+        await yieldFrame();
+      }
+      window.__spaceMemorySampling = true;
       for (let index = 0; index < 100; index++) {
         cameraRef.current.yaw += 0.03;
         cameraRef.current.pitch = Math.sin(index / 18) * 0.25;
         cameraRef.current.zoom = 0.8 + (index % 36) / 30;
-        const renderStarted = performance.now();
-        render(true);
-        const renderMs = performance.now() - renderStarted;
+        const renderer = rendererRef.current;
+        let renderMs = 0;
+        if (renderer && modeRef.current === "webgl2" && !renderer.contextLost) {
+          const packed = packedRef.current;
+          const extent = packed ? memory3DExtent(packed.xyz) : 1;
+          const scale = Math.min(width, height) * 0.4 / extent;
+          renderMs = await renderer.renderFrame(cameraRef.current, scale, width, height);
+        } else {
+          const renderStarted = performance.now();
+          render(false);
+          renderMs = performance.now() - renderStarted;
+        }
         if (index >= 10) samples.push(renderMs);
         window.__spaceMemoryFrames = index + 1;
         await yieldFrame();
@@ -418,20 +451,20 @@ export const MemoryGraph3D = forwardRef<MemoryGraph3DHandle, {
         nodes: packed?.count ?? 0,
         edges: packed?.edgeCount ?? 0,
         renderer: modeRef.current,
-        hardwareRenderer: rendererRef.current?.rendererLabel() ?? "canvas-2d",
+        hardwareRenderer: rendererRef.current?.hardwareRenderer || "canvas-2d",
         frames: samples.length,
         p50: samples[Math.floor(samples.length * 0.5)] ?? 0,
         p95: samples[Math.min(samples.length - 1, Math.floor(samples.length * 0.95))] ?? 0,
         max: samples[samples.length - 1] ?? 0,
         mean
       };
+      window.__spaceMemoryFrameSamples = samples;
       window.__spaceMemoryBenchmark = result;
       return result;
     };
     const observer = new ResizeObserver(() => { resizeCanvases(); pickDirtyRef.current = true; schedule(); });
     observer.observe(surface);
     resizeCanvases();
-    if (packedRef.current && renderer) renderer.setGraph(packedRef.current);
     refreshLabels();
     schedule();
     surface.addEventListener("pointerdown", down);
@@ -441,13 +474,20 @@ export const MemoryGraph3D = forwardRef<MemoryGraph3DHandle, {
     surface.addEventListener("wheel", wheel, { passive: false });
     surface.addEventListener("keydown", key);
     return () => {
+      if (glActiveRef.current === epoch) glActiveRef.current = 0;
       observer.disconnect();
       cancelAnimationFrame(frame);
       window.clearTimeout(wheelTimer);
       redrawRef.current = () => {};
       refreshLabelsRef.current = () => {};
-      renderer?.dispose();
-      rendererRef.current = null;
+      pumpRef.current = () => {};
+      const closing = epoch;
+      queueMicrotask(() => {
+        if (glEpochRef.current !== closing) return;
+        void glBootRef.current?.then(renderer => renderer?.dispose());
+        glBootRef.current = null;
+        rendererRef.current = null;
+      });
       surface.removeEventListener("pointerdown", down);
       surface.removeEventListener("pointermove", move);
       surface.removeEventListener("pointerup", up);
@@ -479,6 +519,7 @@ export const MemoryGraph3D = forwardRef<MemoryGraph3DHandle, {
     fallbackEdgesRef.current = canvasFallbackEdgeIndexes(props.stream.edgePairs, fallbackIndexesRef.current, props.stream.count);
     pickDirtyRef.current = true;
     rendererRef.current?.setGraph(props.stream);
+    pumpRef.current();
     refreshLabelsRef.current();
     redrawRef.current();
   }, [props.stream]);
@@ -497,6 +538,7 @@ export const MemoryGraph3D = forwardRef<MemoryGraph3DHandle, {
     fallbackIndexesRef.current = canvasFallbackIndexes(prepared.packed.kinds);
     fallbackEdgesRef.current = canvasFallbackEdgeIndexes(prepared.packed.edgePairs, fallbackIndexesRef.current, prepared.packed.count);
     rendererRef.current?.setGraph(prepared.packed);
+    pumpRef.current();
     refreshLabelsRef.current();
     redrawRef.current();
   }, [props.nodes, props.edges, props.coordinates]);

@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { memoryGraphOverviewPayloadSchema } from "@space/contracts";
 import { createSyntheticMemoryGraph, syntheticMemoryOverview } from "../src/demo/synthetic-memory-graph.js";
-import { chooseMemoryGraphRenderer } from "../src/features/memory-workspace/memory-3d-gl.js";
+import { chooseMemoryGraphRenderer } from "../src/features/memory-workspace/memory-3d-gl-client.js";
 import { selectMemoryLabels } from "../src/features/memory-workspace/memory-3d-labels.js";
 import {
   canvasFallbackEdgeIndexes,
