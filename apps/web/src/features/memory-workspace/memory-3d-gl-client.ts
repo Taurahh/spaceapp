@@ -10,6 +10,7 @@ export interface MemoryGraphGLClient {
   readonly contextLost: boolean;
   hardwareRenderer: string;
   setGraph(packed: PackedMemoryGraph): void;
+  clearGraph(): void;
   setPositions(xyz: Float32Array): void;
   setFocus(index: number): void;
   render(camera: MemoryCamera3D, scale: number, width: number, height: number, sync: boolean): void;
@@ -91,6 +92,15 @@ export function openMemoryGraphGL(canvas: HTMLCanvasElement, dpr: number, events
           worker.postMessage({ type: "graph", xyz, colors, radii, edgePairs, edgeTypes, epoch: sendEpoch }, [xyz.buffer, colors.buffer, radii.buffer, edgePairs.buffer, edgeTypes.buffer]);
           publishFocus(generation);
         })();
+        graphSend = send.then(() => undefined, () => undefined);
+      },
+      clearGraph() {
+        latestFocus = null;
+        const generation = ++graphSerial;
+        const send = graphSend.then(() => {
+          if (generation !== graphSerial) return;
+          worker.postMessage({ type: "clear" });
+        });
         graphSend = send.then(() => undefined, () => undefined);
       },
       setPositions(xyz) {

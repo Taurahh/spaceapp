@@ -9,6 +9,7 @@ type WorkerScope = {
 type RenderCommand =
   | { type: "init"; canvas: OffscreenCanvas; dpr: number }
   | { type: "graph"; xyz: Float32Array; colors: Uint8Array; radii: Float32Array; edgePairs: Uint32Array; edgeTypes: Uint8Array; epoch: number }
+  | { type: "clear" }
   | { type: "positions"; xyz: Float32Array; epoch: number }
   | { type: "focus"; index: number }
   | { type: "render"; id: number; camera: MemoryCamera3D; scale: number; width: number; height: number; sync: boolean; dpr: number }
@@ -70,6 +71,8 @@ scope.onmessage = (event: MessageEvent<RenderCommand>) => {
       edgeTypes: message.edgeTypes
     });
     schedulePump();
+  } else if (message.type === "clear") {
+    renderer.clearGraph();
   } else if (message.type === "positions") {
     epoch = message.epoch;
     renderer.setPositions(message.xyz);

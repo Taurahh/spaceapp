@@ -17,7 +17,7 @@ import {
   projectMemoryPoint,
   projectMemoryPoints
 } from "../src/features/memory-workspace/memory-3d.js";
-import { publishMemoryLaunchShell, readMemoryGraphLaunch, snapMemoryGraphLaunchSize } from "../src/features/memory-workspace/memory-graph-launch.js";
+import { publishMemoryLaunchShell, readMemoryGraphLaunch, resetMemoryLaunchShellStartup, snapMemoryGraphLaunchSize } from "../src/features/memory-workspace/memory-graph-launch.js";
 import type { MemoryGraphEdge, MemoryGraphNode } from "@space/contracts";
 
 function smallGraph(): { nodes: MemoryGraphNode[]; edges: MemoryGraphEdge[] } {
@@ -260,10 +260,16 @@ describe("memory graph launch query", () => {
     expect(readMemoryGraphLaunch("")).toBeNull();
   });
 
-  it("time-slices the shell only for a direct graph launch", () => {
+  it("time-slices only the first shell publish of a direct graph launch", () => {
+    resetMemoryLaunchShellStartup();
     let calls = 0;
-    publishMemoryLaunchShell(() => { calls += 1; }, "?memoryNodes=50000");
-    publishMemoryLaunchShell(() => { calls += 1; }, "");
-    expect(calls).toBe(2);
+    expect(publishMemoryLaunchShell(() => { calls += 1; }, "?memoryNodes=50000")).toBe(true);
+    expect(publishMemoryLaunchShell(() => { calls += 1; }, "?memoryNodes=50000")).toBe(false);
+    expect(publishMemoryLaunchShell(() => { calls += 1; }, "")).toBe(false);
+    expect(calls).toBe(3);
+    resetMemoryLaunchShellStartup();
+    expect(publishMemoryLaunchShell(() => { calls += 1; }, "")).toBe(false);
+    expect(publishMemoryLaunchShell(() => { calls += 1; }, "?memoryNodes=50000")).toBe(false);
+    expect(calls).toBe(5);
   });
 });

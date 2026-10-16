@@ -524,7 +524,20 @@ export const MemoryGraph3D = forwardRef<MemoryGraph3DHandle, {
   }, [props.benchmark, props.layoutDone]);
 
   useEffect(() => {
-    if (!props.stream || props.stream === packedRef.current) return;
+    if (!props.stream) {
+      if (!packedRef.current && fallbackIndexesRef.current.length === 0) return;
+      packedRef.current = null;
+      fallbackIndexesRef.current = new Uint32Array();
+      fallbackEdgesRef.current = new Uint32Array();
+      labelIndexesRef.current = [];
+      focusRef.current = -1;
+      hoverRef.current = -1;
+      pickDirtyRef.current = true;
+      rendererRef.current?.clearGraph();
+      redrawRef.current();
+      return;
+    }
+    if (props.stream === packedRef.current) return;
     packedRef.current = props.stream;
     fallbackIndexesRef.current = canvasFallbackIndexes(props.stream.kinds);
     fallbackEdgesRef.current = canvasFallbackEdgeIndexes(props.stream.edgePairs, fallbackIndexesRef.current, props.stream.count);

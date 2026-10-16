@@ -38,8 +38,17 @@ export function readMemoryGraphLaunch(search?: string): MemoryGraphLaunch | null
   return { nodes, edges, benchmark: params.get("benchmark") === "1" };
 }
 
-/** Time-slice the covered shell only when the page opens directly on the 3D graph. */
-export function publishMemoryLaunchShell(publish: () => void, search?: string) {
-  if (readMemoryGraphLaunch(search)) startTransition(publish);
+let memoryLaunchStartup = true;
+
+/** Time-slice only the first shell publish of a direct 3D launch. Later room updates stay synchronous. */
+export function publishMemoryLaunchShell(publish: () => void, search?: string): boolean {
+  const startup = memoryLaunchStartup && readMemoryGraphLaunch(search) !== null;
+  memoryLaunchStartup = false;
+  if (startup) startTransition(publish);
   else publish();
+  return startup;
+}
+
+export function resetMemoryLaunchShellStartup() {
+  memoryLaunchStartup = true;
 }

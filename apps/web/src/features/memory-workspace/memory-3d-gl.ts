@@ -254,6 +254,29 @@ export class MemoryGraphWebGL {
     this.uploadRow = 0;
     this.positionsDirty = true;
     this.onMetrics({ uploadMs: performance.now() - started });
+    if (this.count === 0) this.clearFrame();
+  }
+
+  /** Drop the uploaded graph and wipe the canvas so a cleared search cannot leave stale nodes. */
+  clearGraph() {
+    this.count = 0;
+    this.edgeCount = 0;
+    this.focus = -1;
+    this.states = new Uint8Array();
+    this.edgeParamsDirty = false;
+    this.positionsDirty = false;
+    this.filling = false;
+    this.staticStage = "done";
+    this.uploadedGeneration = this.positionGeneration;
+    this.clearFrame();
+  }
+
+  clearFrame() {
+    if (this.contextLost || this.gl.isContextLost()) return;
+    const gl = this.gl;
+    gl.viewport(0, 0, this.canvas.width || 1, this.canvas.height || 1);
+    gl.clearColor(0, 0, 0, 0);
+    gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
   }
 
   setDeviceScale(dpr: number) {
