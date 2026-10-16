@@ -1,3 +1,5 @@
+import { startTransition } from "react";
+
 export const MEMORY_GRAPH_LAUNCH_SIZES = [2_000, 10_000, 50_000] as const;
 export type MemoryGraphLaunchSize = (typeof MEMORY_GRAPH_LAUNCH_SIZES)[number];
 
@@ -28,9 +30,16 @@ export function readMemoryGraphLaunch(search?: string): MemoryGraphLaunch | null
   const requested = Number(raw);
   if (!Number.isFinite(requested) || requested < 1) return null;
   const nodes = snapMemoryGraphLaunchSize(requested);
-  const edgeRaw = Number(params.get("memoryEdges"));
+  const edgeParam = params.get("memoryEdges");
+  const edgeRaw = edgeParam === null || edgeParam.trim() === "" ? Number.NaN : Number(edgeParam);
   const edges = Number.isFinite(edgeRaw) && edgeRaw >= 0
     ? Math.min(MAX_EDGES, Math.floor(edgeRaw))
     : Math.min(MAX_EDGES, nodes * 3);
   return { nodes, edges, benchmark: params.get("benchmark") === "1" };
+}
+
+/** Time-slice the covered shell only when the page opens directly on the 3D graph. */
+export function publishMemoryLaunchShell(publish: () => void, search?: string) {
+  if (readMemoryGraphLaunch(search)) startTransition(publish);
+  else publish();
 }

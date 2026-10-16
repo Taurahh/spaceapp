@@ -138,6 +138,8 @@ export const MemoryGraph3D = forwardRef<MemoryGraph3DHandle, {
 
   useEffect(() => {
     cameraRef.current = { ...DEFAULT_MEMORY_CAMERA };
+    pickDirtyRef.current = true;
+    refreshLabelsRef.current();
     redrawRef.current();
   }, [props.resetToken]);
 
@@ -150,6 +152,7 @@ export const MemoryGraph3D = forwardRef<MemoryGraph3DHandle, {
     const epoch = ++glEpochRef.current;
     glActiveRef.current = epoch;
     const setMode = (next: "webgl2" | "canvas2d") => {
+      if (modeRef.current !== next) pickDirtyRef.current = true;
       modeRef.current = next;
       glCanvas.hidden = next !== "webgl2";
       fallback.hidden = next !== "canvas2d";
@@ -166,12 +169,16 @@ export const MemoryGraph3D = forwardRef<MemoryGraph3DHandle, {
     };
     if (!glBootRef.current) {
       glBootRef.current = openMemoryGraphGL(glCanvas, window.devicePixelRatio || 1, {
-        onLost: () => setMode("canvas2d"),
+        onLost: () => {
+          setMode("canvas2d");
+          redrawRef.current();
+        },
         onRestored: () => {
           const packed = packedRef.current;
           if (packed) rendererRef.current?.setGraph(packed);
           rendererRef.current?.setFocus(focusRef.current);
           setMode("webgl2");
+          refreshLabelsRef.current();
           redrawRef.current();
         }
       });
@@ -215,10 +222,14 @@ export const MemoryGraph3D = forwardRef<MemoryGraph3DHandle, {
       projectMemoryNodes(packed.xyz, packed.radii, cameraRef.current, scale, width, height, projectedRef.current);
       return { packed, scale, extent };
     };
+    const rebuildPick = (packed: PackedMemoryGraph) => {
+      const allowed = modeRef.current === "canvas2d" ? fallbackIndexesRef.current : undefined;
+      pickRef.current.rebuild(projectedRef.current, packed.kinds, allowed);
+    };
     const refreshLabels = () => {
       const projected = projectPacked();
       if (!projected) { labelIndexesRef.current = []; return; }
-      pickRef.current.rebuild(projectedRef.current, projected.packed.kinds);
+      rebuildPick(projected.packed);
       pickDirtyRef.current = false;
       labelIndexesRef.current = pickRef.current.labelCandidates(width, height, MAX_LABEL_CANDIDATES);
       labelZoomBand = cameraRef.current.zoom >= 1.6;
@@ -301,7 +312,7 @@ export const MemoryGraph3D = forwardRef<MemoryGraph3DHandle, {
       if (!packed || packed.count === 0) return -1;
       if (pickDirtyRef.current) {
         projectPacked();
-        pickRef.current.rebuild(projectedRef.current, packed.kinds);
+        rebuildPick(packed);
         pickDirtyRef.current = false;
       }
       return pickRef.current.find(x, y);

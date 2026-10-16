@@ -90,6 +90,7 @@ export function MemoryWorkspace({ shellMode, onClose, initialMode = "calendar" }
   const [stream, setStream] = useState<PackedMemoryGraph | null>(null);
   const [layoutDone, setLayoutDone] = useState(false);
   const [compact, setCompact] = useState<CompactGraph | null>(null);
+  const [reloadToken, setReloadToken] = useState(0);
   const closeDetail = useCallback(() => {
     detailRequest.current++;
     setSelectedNodeId(null);
@@ -260,7 +261,7 @@ export function MemoryWorkspace({ shellMode, onClose, initialMode = "calendar" }
       worker.postMessage({ mode: "fetch", url: `/api/admin/memory/graph/overview?${params.toString()}` });
     }
     return () => { active = false; worker.terminate(); };
-  }, [workspaceMode, query, closeDetail, sizeChoice, demo, launch]);
+  }, [workspaceMode, query, closeDetail, sizeChoice, demo, launch, reloadToken]);
 
   useEffect(() => () => { detailRequest.current++; }, []);
   const selectNode = useCallback((nodeId: string) => {
@@ -317,7 +318,7 @@ export function MemoryWorkspace({ shellMode, onClose, initialMode = "calendar" }
     worker.onerror = event => { setError(`Memory layout could not be calculated: ${event.message || "worker unavailable"}`); worker.terminate(); };
     worker.postMessage({ mode: "layout", nodes: atlas.nodes, edges: atlas.edges });
     return () => worker.terminate();
-  }, [workspaceMode, atlas, compact]);
+  }, [workspaceMode, atlas, compact, reloadToken]);
   const twoDReady = Boolean(atlas.nodes.length) && layout?.atlas === atlas;
   const layoutReady = compact ? layoutDone : twoDReady;
   const layoutPending = !compact && typeof Worker !== "undefined" && atlas.nodes.length > 0 && !twoDReady;
@@ -422,6 +423,7 @@ export function MemoryWorkspace({ shellMode, onClose, initialMode = "calendar" }
                 </Suspense>
               </MemoryGraphErrorBoundary></div>}
               {view3D ? <MemoryGraph3D ref={graphRef} nodes={compact ? [] : atlas.nodes} edges={compact ? [] : atlas.edges} positions={atlasPositions} coordinates={emptyCoordinates} showTitles={showTitles} selectedNodeId={selectedNodeId} onSelectNode={selectNode} loading={loading || (compact ? !layoutDone : layoutPending)} resetToken={reset3D} layoutDone={layoutDone} benchmark={benchmarkActive} stream={stream} /> : null}
+              {view3D && error ? <div className="memory-workspace-error memory-atlas-load-error" role="alert"><AlertTriangle aria-hidden="true" /><span>{error}</span><button type="button" onClick={() => setReloadToken(token => token + 1)}>Retry</button></div> : null}
             </div>
             {!selectedNodeId && displayGroups.length > 0 ? <aside className="memory-atlas-topics" aria-label="Map topics">
               <span className="memory-atlas-eyebrow">COLOR GUIDE</span>
@@ -430,7 +432,7 @@ export function MemoryWorkspace({ shellMode, onClose, initialMode = "calendar" }
             </aside> : null}
             {!selectedNodeId ? <aside className="memory-atlas-insight"><span className="memory-atlas-eyebrow">THE BIGGER PICTURE</span><strong>{semanticCount.toLocaleString()}</strong><p>semantic connections</p><small>Explore the links between your memories.</small><div className="memory-atlas-spectrum" /></aside> : null}
             {stale ? <div className="memory-atlas-stale" role="status"><AlertTriangle aria-hidden="true" /> Snapshot awaiting refresh</div> : null}
-            {query && !loading && !error ? <div className="memory-atlas-search-status" role="status">{atlas.nodes.length ? `${atlas.nodes.length.toLocaleString()} matching nodes` : "No memories found. Try another search."}</div> : null}
+            {query && !loading && !error ? <div className="memory-atlas-search-status" role="status">{visibleNodeCount ? `${visibleNodeCount.toLocaleString()} matching nodes` : "No memories found. Try another search."}</div> : null}
           </>
         )}
         {selectedNodeId ? <div className="memory-atlas-detail">

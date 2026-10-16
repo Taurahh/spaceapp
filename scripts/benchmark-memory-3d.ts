@@ -166,18 +166,20 @@ async function browserSample(port: number, nodes: number, edges: number) {
     `--user-data-dir=${userData}`,
     "about:blank"
   ], { stdio: "ignore" });
+  let browser: WebSocket | undefined;
   try {
     await waitForHttp(`http://127.0.0.1:${debugPort}/json/version`, 20_000);
     const version = await fetch(`http://127.0.0.1:${debugPort}/json/version`).then(response => response.json()) as { webSocketDebuggerUrl: string };
-    const browser = new WebSocket(version.webSocketDebuggerUrl);
+    const socket = new WebSocket(version.webSocketDebuggerUrl);
+    browser = socket;
     await new Promise<void>((resolve, reject) => {
-      browser.addEventListener("open", () => resolve());
-      browser.addEventListener("error", () => reject(new Error("Chrome DevTools socket failed.")));
+      socket.addEventListener("open", () => resolve());
+      socket.addEventListener("error", () => reject(new Error("Chrome DevTools socket failed.")));
     });
     const pending = new Map<number, { resolve: (value: unknown) => void; reject: (error: Error) => void }>();
     let next = 0;
     const events: Array<{ method: string; params: Record<string, unknown> }> = [];
-    browser.addEventListener("message", (event) => {
+    socket.addEventListener("message", (event) => {
       const message = JSON.parse(String(event.data)) as { id?: number; result?: unknown; error?: { message: string }; method?: string; params?: Record<string, unknown> };
       if (message.id && pending.has(message.id)) {
         const waiter = pending.get(message.id)!;
@@ -188,7 +190,7 @@ async function browserSample(port: number, nodes: number, edges: number) {
     });
     const call = (method: string, params: Record<string, unknown> = {}, sessionId?: string) => {
       const id = ++next;
-      browser.send(JSON.stringify({ id, method, params, sessionId }));
+      socket.send(JSON.stringify({ id, method, params, sessionId }));
       return new Promise((resolve, reject) => pending.set(id, { resolve, reject }));
     };
     const target = await call("Target.createTarget", { url: "about:blank" }) as { targetId: string };
@@ -226,10 +228,10 @@ async function browserSample(port: number, nodes: number, edges: number) {
       }
       await new Promise(resolve => setTimeout(resolve, 500));
     }
-    browser.close();
     if (!sample) throw new Error(`Benchmark did not finish for ${nodes} nodes. Last probe: ${last}`);
     return sample;
   } finally {
+    browser?.close();
     chrome.kill("SIGKILL");
   }
 }

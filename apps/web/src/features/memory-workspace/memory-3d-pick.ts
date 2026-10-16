@@ -74,7 +74,7 @@ export class SpatialPickIndex {
   private labelBest = new Int32Array(0);
   private projected: ProjectedMemoryNodes | null = null;
 
-  rebuild(projected: ProjectedMemoryNodes, kinds: Uint8Array) {
+  rebuild(projected: ProjectedMemoryNodes, kinds: Uint8Array, allowed?: Uint32Array) {
     const count = projected.count;
     this.count = count;
     this.projected = projected;
@@ -86,8 +86,13 @@ export class SpatialPickIndex {
     this.heads.fill(-1);
     this.labelBase.clear();
     if (this.labelBest.length < count * LABEL_SLOTS) this.labelBest = new Int32Array(Math.max(LABEL_SLOTS, count * LABEL_SLOTS));
+    const members = allowed ? new Uint8Array(count) : null;
+    if (members && allowed) {
+      for (const index of allowed) if (index >= 0 && index < count) members[index] = 1;
+    }
     let slot = 0;
     for (let index = 0; index < count; index++) {
+      if (members && members[index] !== 1) continue;
       const x = projected.x[index] ?? 0;
       const y = projected.y[index] ?? 0;
       if (!Number.isFinite(x) || !Number.isFinite(y)) continue;

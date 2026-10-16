@@ -407,7 +407,7 @@ export function registerMemoryGraphRoutes(
     const selectedEdges = matchingEdges
       .filter((edge) => selectedNodeIds.has(edge.source) && selectedNodeIds.has(edge.target))
       .sort((a, b) => Number(b.type === "CONTAINS" || b.type === "DERIVED_FROM") - Number(a.type === "CONTAINS" || a.type === "DERIVED_FROM"))
-      .slice(0, memoryGraphOverviewEdgeLimit(nodeLimit));
+      .slice(0, memoryGraphOverviewEdgeLimit(Math.max(1, selectedNodes.length)));
     const data = memoryGraphOverviewPayloadSchema.parse({
       version: snapshot.version,
       layoutVersion: snapshot.layoutVersion,

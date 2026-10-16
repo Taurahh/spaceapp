@@ -17,7 +17,7 @@ import {
   projectMemoryPoint,
   projectMemoryPoints
 } from "../src/features/memory-workspace/memory-3d.js";
-import { readMemoryGraphLaunch, snapMemoryGraphLaunchSize } from "../src/features/memory-workspace/memory-graph-launch.js";
+import { publishMemoryLaunchShell, readMemoryGraphLaunch, snapMemoryGraphLaunchSize } from "../src/features/memory-workspace/memory-graph-launch.js";
 import type { MemoryGraphEdge, MemoryGraphNode } from "@space/contracts";
 
 function smallGraph(): { nodes: MemoryGraphNode[]; edges: MemoryGraphEdge[] } {
@@ -107,6 +107,21 @@ describe("3D memory picking and labels", () => {
     expect(index.find(100, 80)).toBe(0);
     expect(index.find(400, 90)).toBe(1);
     expect(index.find(10, 10)).toBe(-1);
+  });
+
+  it("ignores nodes the canvas fallback did not draw", () => {
+    const projected = createProjectedMemoryNodes(3);
+    projected.x.set([100, 108, 400]);
+    projected.y.set([80, 80, 90]);
+    projected.z.set([5, 0, 1]);
+    projected.radius.set([12, 12, 8]);
+    const index = new SpatialPickIndex();
+    index.rebuild(projected, new Uint8Array([0, 0, 2]));
+    expect(index.find(104, 80)).toBe(1);
+    index.rebuild(projected, new Uint8Array([0, 0, 2]), new Uint32Array([0, 2]));
+    expect(index.find(104, 80)).toBe(0);
+    expect(index.find(400, 90)).toBe(2);
+    expect(index.labelCandidates(800, 600).includes(1)).toBe(false);
   });
 
   it("answers a 50,000 node pick in under 4 ms", () => {
@@ -227,6 +242,28 @@ describe("memory graph launch query", () => {
       edges: 150_000,
       benchmark: true
     });
+    expect(readMemoryGraphLaunch("?memoryNodes=50000&benchmark=1")).toEqual({
+      nodes: 50_000,
+      edges: 150_000,
+      benchmark: true
+    });
+    expect(readMemoryGraphLaunch("?memoryNodes=2000&memoryEdges=")).toEqual({
+      nodes: 2_000,
+      edges: 6_000,
+      benchmark: false
+    });
+    expect(readMemoryGraphLaunch("?memoryNodes=2000&memoryEdges=0")).toEqual({
+      nodes: 2_000,
+      edges: 0,
+      benchmark: false
+    });
     expect(readMemoryGraphLaunch("")).toBeNull();
+  });
+
+  it("time-slices the shell only for a direct graph launch", () => {
+    let calls = 0;
+    publishMemoryLaunchShell(() => { calls += 1; }, "?memoryNodes=50000");
+    publishMemoryLaunchShell(() => { calls += 1; }, "");
+    expect(calls).toBe(2);
   });
 });

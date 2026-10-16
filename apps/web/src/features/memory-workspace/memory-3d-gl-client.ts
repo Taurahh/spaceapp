@@ -41,6 +41,7 @@ export function openMemoryGraphGL(canvas: HTMLCanvasElement, dpr: number, events
     let ackedEpoch = -1;
     let graphSerial = 0;
     let graphSend: Promise<void> = Promise.resolve();
+    let latestFocus: number | null = null;
     let lost = false;
     let settled = false;
     const pending = new Map<number, (ms: number) => void>();
@@ -58,6 +59,10 @@ export function openMemoryGraphGL(canvas: HTMLCanvasElement, dpr: number, events
       window.clearTimeout(timer);
       worker.terminate();
       resolve(null);
+    };
+    const publishFocus = (generation: number) => {
+      if (latestFocus === null || generation !== graphSerial) return;
+      worker.postMessage({ type: "focus", index: latestFocus });
     };
     const client: MemoryGraphGLClient = {
       get contextLost() { return lost; },
@@ -84,6 +89,7 @@ export function openMemoryGraphGL(canvas: HTMLCanvasElement, dpr: number, events
           const edgeTypes = source.edgeTypes.slice();
           if (generation !== graphSerial) return;
           worker.postMessage({ type: "graph", xyz, colors, radii, edgePairs, edgeTypes, epoch: sendEpoch }, [xyz.buffer, colors.buffer, radii.buffer, edgePairs.buffer, edgeTypes.buffer]);
+          publishFocus(generation);
         })();
         graphSend = send.then(() => undefined, () => undefined);
       },
@@ -97,7 +103,9 @@ export function openMemoryGraphGL(canvas: HTMLCanvasElement, dpr: number, events
         });
       },
       setFocus(index) {
-        worker.postMessage({ type: "focus", index });
+        latestFocus = index;
+        const generation = graphSerial;
+        void graphSend.then(() => publishFocus(generation));
       },
       render(camera, scale, width, height, sync) {
         worker.postMessage({ type: "render", id: ++nextRender, camera, scale, width, height, sync, dpr: window.devicePixelRatio || dpr });

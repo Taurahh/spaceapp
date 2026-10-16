@@ -77,7 +77,7 @@ import {
 } from "./features/ui-theme/app-icons.js";
 import { SensitiveDataMask } from "./features/sensitive-data/SensitiveDataMask.js";
 import { SpaceToggle } from "./features/ui-controls/SpaceToggle.js";
-import { lazy, startTransition, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type DragEvent as ReactDragEvent, type ReactNode, type RefObject } from "react";
+import { lazy, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type DragEvent as ReactDragEvent, type ReactNode, type RefObject } from "react";
 import type {
   Artifact,
   AgentRuntime,
@@ -242,7 +242,7 @@ import { useAdminUsers } from "./features/rooms-dock/useAdminUsers.js";
 import { ensureProjectFolder, loadBoundedRoomCatalog, sortRoomsByOrder } from "./features/rooms-dock/room-catalog.js";
 import { useAppView } from "./features/help/useAppView.js";
 import { MemoryWorkspaceErrorBoundary } from "./features/memory-workspace/MemoryWorkspaceErrorBoundary.js";
-import { readMemoryGraphLaunch } from "./features/memory-workspace/memory-graph-launch.js";
+import { publishMemoryLaunchShell, readMemoryGraphLaunch } from "./features/memory-workspace/memory-graph-launch.js";
 import { useManageController } from "./features/server-actions/useManageController.js";
 import { CliRuntimeRestartAllDialog, ServerRestartDialog } from "./features/server-actions/RestartDialogs.js";
 import { CliLauncherMenu } from "./features/cli-launcher/CliLauncherMenu.js";
@@ -1382,17 +1382,13 @@ export function App() {
     roomEventsRef.current = snapshot.events;
     swarmStateRef.current = snapshot.swarm;
     selectedPaneIdRef.current = snapshot.selectedPaneId;
-    const publish = () => {
+    publishMemoryLaunchShell(() => {
       setPanes(snapshot.panes);
       setTurns(snapshot.turns);
       setRoomEvents(snapshot.events);
       setSwarmState(snapshot.swarm);
       setSelectedPaneId(snapshot.selectedPaneId);
-    };
-    // A direct 50k launch renders the covered shell and the graph together. Time-slice the shell
-    // so that commit stays under the main-thread load budget; ordinary room switches stay eager.
-    if (readMemoryGraphLaunch()) startTransition(publish);
-    else publish();
+    });
   }
 
   function clearActiveRoomRuntime() {

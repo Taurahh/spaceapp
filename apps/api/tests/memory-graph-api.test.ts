@@ -1604,4 +1604,43 @@ describe("Memory graph API", () => {
     expect(expandedBody.summary.sourceCount).toBeLessThanOrEqual(24);
     await app.close();
   });
+
+  it("caps overview edges at three per returned node when the archive is smaller than the requested limit", async () => {
+    const graphSnapshot = snapshot() as MemoryGraphSnapshot;
+    graphSnapshot.nodes = Array.from({ length: 4 }, (_, index) => ({
+      id: `memory:${index}`,
+      type: "MEMORY" as const,
+      label: `Memory ${index}`,
+      sourcePath: null,
+      recordId: null
+    }));
+    const edges: MemoryGraphSnapshot["edges"] = [];
+    for (let source = 0; source < 4; source++) {
+      for (let target = 0; target < 4; target++) {
+        if (source === target) continue;
+        for (let copy = 0; copy < 3; copy++) {
+          edges.push({
+            id: `edge:${source}-${target}-${copy}`,
+            source: `memory:${source}`,
+            target: `memory:${target}`,
+            type: "SEMANTICALLY_RELATED" as const,
+            origin: "DETERMINISTIC_TFIDF" as const,
+            confidence: 0.4,
+            evidence: "Related memories."
+          });
+        }
+      }
+    }
+    graphSnapshot.edges = edges;
+    graphSnapshot.summary = { ...graphSnapshot.summary, sourceCount: 0, nodeCount: 4, edgeCount: edges.length, recordCount: 0 };
+    const app = await memoryGraphApp(true, new InMemorySpaceStore(), false, undefined, { graphSnapshot });
+    const response = await app.inject({ method: "GET", url: "/api/admin/memory/graph/overview?limit=50", headers: { cookie } });
+    expect(response.statusCode).toBe(200);
+    const data = response.json().data;
+    expect(data.nodes).toHaveLength(4);
+    expect(data.edges).toHaveLength(12);
+    expect(data.totalMatchingEdges).toBe(36);
+    expect(data.truncated).toBe(true);
+    await app.close();
+  });
 });
